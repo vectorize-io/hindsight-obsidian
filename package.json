@@ -1,6 +1,6 @@
 {
   "name": "@vectorize-io/hindsight-obsidian",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Obsidian plugin for Hindsight — sync your vault into agent memory and chat grounded on your notes",
   "license": "MIT",
   "homepage": "https://hindsight.vectorize.io",
