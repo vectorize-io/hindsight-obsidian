@@ -26,6 +26,8 @@ export interface NoteState {
   hash: string;
   mtime: number;
   syncedAt: string;
+  operationId?: string;
+  operationStatus?: "completed";
 }
 
 export type SyncIndex = Record<string, NoteState>;
@@ -81,6 +83,18 @@ function dateTags(prefix: string, ms: number): string[] {
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth() + 1).padStart(2, "0");
   return [`${prefix}:${year}`, `${prefix}:${year}-${month}`];
+}
+
+function lifecycle(path: string): "current" | "archive" {
+  return underFolder(path, "_archive") ? "archive" : "current";
+}
+
+function noteKind(path: string): "task" | "area" | "thino" | "work-session" | "other" {
+  if (underFolder(path, "TaskNotes/Tasks")) return "task";
+  if (underFolder(path, "Areas")) return "area";
+  if (underFolder(path, "_entries/thinos")) return "thino";
+  if (underFolder(path, "_entries/work-sessions")) return "work-session";
+  return "other";
 }
 
 async function mapLimit<T>(
@@ -165,15 +179,33 @@ export class SyncEngine {
     // `path` lets API consumers (automations) map a recall hit back to the note.
     const metadata = { ...note.metadata, vault: this.config.vaultName, path: file.path };
 
-    await this.client.retain(this.config.bankId, this.docId(file.path), note.body, {
-      tags,
-      metadata,
+    const lifecycleTag = lifecycle(file.path);
+    const kind = noteKind(file.path);
+    const provenanceTags = [
+      "source:obsidian",
+      `lifecycle:${lifecycleTag}`,
+      `kind:${kind}`,
+    ];
+    const observationScopes = [
+      ["source:obsidian", `vault:${this.config.vaultName}`, `lifecycle:${lifecycleTag}`],
+    ];
+
+    const result = await this.client.retain(this.config.bankId, this.docId(file.path), raw, {
+      tags: [...new Set([...tags, ...provenanceTags])],
+      metadata: { ...metadata, source: "obsidian", lifecycle: lifecycleTag, kind },
       timestamp: note.timestamp ?? isoFromMillis(file.stat.ctime),
       updateMode: "replace",
+      observationScopes,
     });
 
     const outcome: IngestOutcome = prev ? "updated" : "created";
-    this.index[file.path] = { hash, mtime: file.stat.mtime, syncedAt: this.nowIso() };
+    this.index[file.path] = {
+      hash,
+      mtime: file.stat.mtime,
+      syncedAt: this.nowIso(),
+      operationId: result.operationId,
+      operationStatus: result.status,
+    };
     if (doPersist) await this.persist(this.index);
     return outcome;
   }

@@ -6,7 +6,13 @@
  */
 
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import type { ReflectOptions, ReflectResponse, RetainOptions } from "./types";
+import type {
+  OperationResponse,
+  ReflectOptions,
+  ReflectResponse,
+  RetainOptions,
+  RetainResult,
+} from "./types";
 
 /**
  * Encode a vault-relative document id for use in a URL `:path` segment:
@@ -21,7 +27,12 @@ export class HindsightClient {
   private readonly baseUrl: string;
   private readonly token: string | undefined;
 
-  constructor(baseUrl: string, token?: string) {
+  constructor(
+    baseUrl: string,
+    token?: string,
+    private readonly operationPollIntervalMs = 1_000,
+    private readonly operationTimeoutMs = 15 * 60_000
+  ) {
     const url = (baseUrl ?? "").trim();
     if (!url) throw new Error("Hindsight API URL is required");
     this.baseUrl = url.replace(/\/+$/, "");
@@ -62,7 +73,7 @@ export class HindsightClient {
     documentId: string,
     content: string,
     options: RetainOptions = {}
-  ): Promise<void> {
+  ): Promise<RetainResult> {
     const item: Record<string, unknown> = {
       content,
       document_id: documentId,
@@ -72,8 +83,40 @@ export class HindsightClient {
     if (options.tags?.length) item.tags = options.tags;
     if (options.metadata && Object.keys(options.metadata).length) item.metadata = options.metadata;
     if (options.timestamp) item.timestamp = options.timestamp;
+    if (options.observationScopes?.length) item.observation_scopes = options.observationScopes;
 
-    await this.send("POST", this.bankUrl(bankId, "/memories"), { items: [item], async: true });
+    const response = await this.send("POST", this.bankUrl(bankId, "/memories"), {
+      items: [item],
+      async: true,
+    });
+    const operationId = (response.json as { operation_id?: string }).operation_id;
+    if (!operationId) throw new Error("Hindsight retain response did not include operation_id");
+    const operation = await this.waitForOperation(bankId, operationId);
+    return {
+      operationId,
+      status: "completed",
+      completedAt: operation.updated_at,
+    };
+  }
+
+  async waitForOperation(bankId: string, operationId: string): Promise<OperationResponse> {
+    const started = Date.now();
+    while (Date.now() - started <= this.operationTimeoutMs) {
+      const response = await this.send(
+        "GET",
+        this.bankUrl(bankId, `/operations/${encodeURIComponent(operationId)}`)
+      );
+      const operation = response.json as OperationResponse;
+      if (operation.status === "completed") return operation;
+      if (operation.status === "failed" || operation.status === "cancelled") {
+        const detail = operation.error ? `: ${JSON.stringify(operation.error)}` : "";
+        throw new Error(`Hindsight operation ${operationId} ${operation.status}${detail}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.operationPollIntervalMs));
+    }
+    throw new Error(
+      `Hindsight operation ${operationId} did not complete within ${this.operationTimeoutMs}ms`
+    );
   }
 
   /** Delete a document and cascade to its memory units. */

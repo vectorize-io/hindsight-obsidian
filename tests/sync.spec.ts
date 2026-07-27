@@ -10,7 +10,11 @@ interface FileSpec {
 
 function fakeClient() {
   return {
-    retain: vi.fn(async (_bank: string, _docId: string, _content: string, _opts?: unknown) => {}),
+    retain: vi.fn(async (_bank: string, _docId: string, _content: string, _opts?: unknown) => ({
+      operationId: "op-1",
+      status: "completed" as const,
+      completedAt: "T0",
+    })),
     deleteDocument: vi.fn(async (_bank: string, _docId: string) => {}),
   };
 }
@@ -88,7 +92,7 @@ describe("SyncEngine", () => {
       string,
       string,
       string,
-      { tags: string[]; metadata: Record<string, string> },
+      { tags: string[]; metadata: Record<string, string>; observationScopes: string[][] },
     ];
     expect(docId).toBe("Personal/Work/Clients/acme.md");
     expect(opts.tags).toEqual(
@@ -100,10 +104,33 @@ describe("SyncEngine", () => {
         "created:2026-03",
         "updated:2026",
         "updated:2026-06",
+        "source:obsidian",
+        "lifecycle:current",
+        "kind:other",
       ])
     );
+    expect(opts.observationScopes).toEqual([
+      ["source:obsidian", "vault:Personal", "lifecycle:current"],
+    ]);
     expect(opts.metadata.path).toBe("Work/Clients/acme.md");
     expect(opts.metadata.vault).toBe("Personal");
+  });
+
+  it("retains full frontmatter while using parsed fields for metadata", async () => {
+    const raw = "---\nstatus: open\ntags: [project]\n---\n# Plan\nBody";
+    const files = { "TaskNotes/Tasks/plan.md": { content: raw, mtime: 1, ctime: 0 } };
+    const { engine, client, vault, index } = makeEngine(files);
+    await engine.ingestFile(vault.getMarkdownFiles()[0]);
+    expect(client.retain.mock.calls[0][2]).toBe(raw);
+    expect(client.retain.mock.calls[0][3]).toEqual(
+      expect.objectContaining({
+        tags: expect.arrayContaining(["kind:task", "lifecycle:current"]),
+      })
+    );
+    expect(index["TaskNotes/Tasks/plan.md"]).toMatchObject({
+      operationId: "op-1",
+      operationStatus: "completed",
+    });
   });
 
   it("re-ingests (updated) when content changes", async () => {

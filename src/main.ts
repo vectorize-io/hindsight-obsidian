@@ -30,7 +30,7 @@ export default class HindsightPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadPluginData();
     this.rebuildClient();
-    this.scheduleFlush = debounce(() => void this.flushDirty(), 4000, false);
+    this.configureDebouncer();
 
     addIcon(HINDSIGHT_ICON_ID, HINDSIGHT_ICON_SVG);
     this.registerView(VIEW_TYPE_CHAT, (leaf) => new ChatView(leaf, this));
@@ -161,8 +161,14 @@ export default class HindsightPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    this.configureDebouncer();
     this.rebuildClient();
     await this.savePluginData();
+  }
+
+  private configureDebouncer(): void {
+    const waitMs = Math.max(1, this.settings.syncDebounceSeconds) * 1_000;
+    this.scheduleFlush = debounce(() => void this.flushDirty(), waitMs, false);
   }
 
   // ── Actions ─────────────────────────────────────────────────────────────
