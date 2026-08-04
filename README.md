@@ -63,7 +63,7 @@ Open **Settings → Hindsight**:
 
 ## Commands
 
-- **Sync vault now** — full reconcile (ingest changed notes, prune deleted ones).
+- **Sync vault now** — full reconcile (ingest changed notes; never bulk-prune from a narrowed scope).
 - **Ingest current note** — force-sync the active note.
 - **Open chat** — open the grounded chat panel.
 
@@ -73,7 +73,7 @@ Open **Settings → Hindsight**:
 note created / edited ──▶ retain(documentId = note path)     (upsert; replaces prior version)
 note renamed         ──▶ deleteDocument(old) + retain(new)
 note deleted         ──▶ deleteDocument(path)
-"Sync vault now"     ──▶ reconcile: ingest drifted notes, prune orphans
+"Sync vault now"     ──▶ reconcile: ingest drifted notes, preserve unmatched documents
 
 chat turn            ──▶ reflect(question) over the whole bank
                          └─ answer + citations (→ source notes) + reasoning

@@ -193,10 +193,13 @@ export default class HindsightPlugin extends Plugin {
     new Notice("Hindsight: syncing vault…");
     try {
       const engine = this.engine;
-      const s = await this.withSync(() => engine.reconcile());
+      // Reconcile is intentionally non-pruning. Live delete/rename events still
+      // remove their owned documents, but a stale or narrowed include scope must
+      // never be interpreted as permission to delete historical bank content.
+      const s = await this.withSync(() => engine.reconcile({ prune: false }));
       await this.savePluginData();
       new Notice(
-        `Hindsight: ${s.added} added, ${s.updated} updated, ${s.deleted} deleted, ${s.unchanged} unchanged.`
+        `Hindsight: ${s.added} added, ${s.updated} updated, ${s.deleted} deleted, ${s.unchanged} unchanged, ${s.failed} failed.`
       );
     } catch (err) {
       this.reportError(err);
