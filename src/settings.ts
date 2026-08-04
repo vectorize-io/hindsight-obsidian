@@ -10,6 +10,8 @@ export interface HindsightSettings {
   includeFolders: string[];
   excludeFolders: string[];
   syncOnEdit: boolean;
+  /** Quiet window before edited notes are submitted. */
+  syncDebounceSeconds: number;
   defaultBudget: Budget;
   /** DESIGN.md §0.5: OFF by default — keeps Hindsight from becoming a 2nd source of truth. */
   rememberConversations: boolean;
@@ -28,6 +30,7 @@ export const DEFAULT_SETTINGS: HindsightSettings = {
   includeFolders: [],
   excludeFolders: [],
   syncOnEdit: true,
+  syncDebounceSeconds: 300,
   defaultBudget: "low",
   rememberConversations: false,
   // On by default: all vaults share one bank, so document ids must be vault-prefixed
@@ -126,6 +129,22 @@ export class HindsightSettingTab extends PluginSettingTab {
           this.plugin.settings.syncOnEdit = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Edit quiet window")
+      .setDesc("Seconds to wait after the last edit before ingesting the changed note.")
+      .addText((t) =>
+        t
+          .setPlaceholder("300")
+          .setValue(String(this.plugin.settings.syncDebounceSeconds))
+          .onChange(async (v) => {
+            const parsed = Number.parseInt(v, 10);
+            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 86_400) {
+              this.plugin.settings.syncDebounceSeconds = parsed;
+              await this.plugin.saveSettings();
+            }
+          })
       );
 
     new Setting(containerEl)

@@ -30,7 +30,7 @@ export default class HindsightPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadPluginData();
     this.rebuildClient();
-    this.scheduleFlush = debounce(() => void this.flushDirty(), 4000, false);
+    this.configureDebouncer();
 
     addIcon(HINDSIGHT_ICON_ID, HINDSIGHT_ICON_SVG);
     this.registerView(VIEW_TYPE_CHAT, (leaf) => new ChatView(leaf, this));
@@ -161,8 +161,14 @@ export default class HindsightPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    this.configureDebouncer();
     this.rebuildClient();
     await this.savePluginData();
+  }
+
+  private configureDebouncer(): void {
+    const waitMs = Math.max(1, this.settings.syncDebounceSeconds) * 1_000;
+    this.scheduleFlush = debounce(() => void this.flushDirty(), waitMs, false);
   }
 
   // ── Actions ─────────────────────────────────────────────────────────────
@@ -187,10 +193,13 @@ export default class HindsightPlugin extends Plugin {
     new Notice("Hindsight: syncing vault…");
     try {
       const engine = this.engine;
-      const s = await this.withSync(() => engine.reconcile());
+      // Reconcile is intentionally non-pruning. Live delete/rename events still
+      // remove their owned documents, but a stale or narrowed include scope must
+      // never be interpreted as permission to delete historical bank content.
+      const s = await this.withSync(() => engine.reconcile({ prune: false }));
       await this.savePluginData();
       new Notice(
-        `Hindsight: ${s.added} added, ${s.updated} updated, ${s.deleted} deleted, ${s.unchanged} unchanged.`
+        `Hindsight: ${s.added} added, ${s.updated} updated, ${s.deleted} deleted, ${s.unchanged} unchanged, ${s.failed} failed.`
       );
     } catch (err) {
       this.reportError(err);

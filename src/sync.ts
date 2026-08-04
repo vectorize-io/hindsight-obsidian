@@ -12,6 +12,8 @@ import { createHash } from "node:crypto";
 import type { HindsightClient } from "./client";
 import { normalizeNote } from "./frontmatter";
 
+export type SyncClient = Pick<HindsightClient, "retain" | "deleteDocument">;
+
 export interface SyncFile {
   path: string;
   stat: { mtime: number; ctime: number };
@@ -26,6 +28,8 @@ export interface NoteState {
   hash: string;
   mtime: number;
   syncedAt: string;
+  operationId?: string;
+  operationStatus?: "completed";
 }
 
 export type SyncIndex = Record<string, NoteState>;
@@ -45,9 +49,31 @@ export interface ReconcileSummary {
   updated: number;
   deleted: number;
   unchanged: number;
+  failed: number;
 }
 
 export type IngestOutcome = "created" | "updated" | "skipped";
+
+export interface ReconcileProgress {
+  completed: number;
+  total: number;
+  path: string;
+  outcome?: IngestOutcome;
+  error?: string;
+  summary: ReconcileSummary;
+}
+
+export interface ReconcileOptions {
+  /** Delete indexed documents whose source note is missing. Off for safe backfills. */
+  prune?: boolean;
+  /** One worker preserves exact priority order and avoids competing with a serial extractor. */
+  concurrency?: number;
+  /** Record a failed note and continue; a later run retries it because it is not checkpointed. */
+  continueOnError?: boolean;
+  /** Bypass only the local checkpoint; the server may still content-hash unchanged text. */
+  force?: boolean | ((file: SyncFile) => boolean);
+  onProgress?: (progress: ReconcileProgress) => void | Promise<void>;
+}
 
 function underFolder(path: string, folder: string): boolean {
   const f = folder.replace(/^\/+|\/+$/g, "");
@@ -83,6 +109,43 @@ function dateTags(prefix: string, ms: number): string[] {
   return [`${prefix}:${year}`, `${prefix}:${year}-${month}`];
 }
 
+function lifecycle(path: string): "current" | "archive" {
+  return underFolder(path, "_archive") ? "archive" : "current";
+}
+
+function noteKind(path: string): "task" | "area" | "thino" | "work-session" | "other" {
+  if (underFolder(path, "TaskNotes/Tasks")) return "task";
+  if (underFolder(path, "Areas")) return "area";
+  if (underFolder(path, "_entries/thinos")) return "thino";
+  if (underFolder(path, "_entries/work-sessions")) return "work-session";
+  return "other";
+}
+
+/** Minimum tags required to distinguish provenance, authority, and note class at recall. */
+export function requiredProvenanceTags(path: string, vaultName: string): string[] {
+  return [
+    "source:obsidian",
+    `vault:${vaultName}`,
+    `lifecycle:${lifecycle(path)}`,
+    `kind:${noteKind(path)}`,
+  ];
+}
+
+/** TaskNotes first, then newest modified note first, with a stable path tie-break. */
+export function compareSyncFiles(a: SyncFile, b: SyncFile): number {
+  const taskOrder = Number(noteKind(a.path) !== "task") - Number(noteKind(b.path) !== "task");
+  if (taskOrder !== 0) return taskOrder;
+  const modifiedOrder = b.stat.mtime - a.stat.mtime;
+  if (modifiedOrder !== 0) return modifiedOrder;
+  return a.path.localeCompare(b.path);
+}
+
+function usableTimestamp(value: string | undefined, fallbackMs: number): string {
+  if (value === "unset") return value;
+  if (value && Number.isFinite(Date.parse(value))) return value;
+  return isoFromMillis(fallbackMs);
+}
+
 async function mapLimit<T>(
   items: T[],
   limit: number,
@@ -100,7 +163,7 @@ async function mapLimit<T>(
 
 export class SyncEngine {
   constructor(
-    private readonly client: HindsightClient,
+    private readonly client: SyncClient,
     private readonly vault: SyncVault,
     private config: SyncConfig,
     private index: SyncIndex,
@@ -154,7 +217,9 @@ export class SyncEngine {
     // Auto-scope tags: implicit scoping derived from normal Obsidian usage, so the
     // user only thinks about scope at recall/reflect time (DESIGN.md §4.6). Recall
     // can then filter by any combination via tag_groups, from the UI or the API.
-    const createdMs = note.timestamp ? Date.parse(note.timestamp) : file.stat.ctime;
+    const timestamp = usableTimestamp(note.timestamp, file.stat.ctime);
+    const parsedTimestamp = timestamp === "unset" ? Number.NaN : Date.parse(timestamp);
+    const createdMs = Number.isFinite(parsedTimestamp) ? parsedTimestamp : file.stat.ctime;
     const scopeTags = [
       `vault:${this.config.vaultName}`,
       ...folderTags(file.path),
@@ -165,15 +230,29 @@ export class SyncEngine {
     // `path` lets API consumers (automations) map a recall hit back to the note.
     const metadata = { ...note.metadata, vault: this.config.vaultName, path: file.path };
 
-    await this.client.retain(this.config.bankId, this.docId(file.path), note.body, {
-      tags,
-      metadata,
-      timestamp: note.timestamp ?? isoFromMillis(file.stat.ctime),
+    const lifecycleTag = lifecycle(file.path);
+    const kind = noteKind(file.path);
+    const provenanceTags = requiredProvenanceTags(file.path, this.config.vaultName);
+    const observationScopes = [
+      ["source:obsidian", `vault:${this.config.vaultName}`, `lifecycle:${lifecycleTag}`],
+    ];
+
+    const result = await this.client.retain(this.config.bankId, this.docId(file.path), raw, {
+      tags: [...new Set([...tags, ...provenanceTags])],
+      metadata: { ...metadata, source: "obsidian", lifecycle: lifecycleTag, kind },
+      timestamp,
       updateMode: "replace",
+      observationScopes,
     });
 
     const outcome: IngestOutcome = prev ? "updated" : "created";
-    this.index[file.path] = { hash, mtime: file.stat.mtime, syncedAt: this.nowIso() };
+    this.index[file.path] = {
+      hash,
+      mtime: file.stat.mtime,
+      syncedAt: this.nowIso(),
+      operationId: result.operationId,
+      operationStatus: result.status,
+    };
     if (doPersist) await this.persist(this.index);
     return outcome;
   }
@@ -201,16 +280,52 @@ export class SyncEngine {
    * we previously synced whose note is now gone or excluded. Self-heals after
    * the plugin was disabled during edits.
    */
-  async reconcile(): Promise<ReconcileSummary> {
-    const summary: ReconcileSummary = { added: 0, updated: 0, deleted: 0, unchanged: 0 };
-    const files = this.vault.getMarkdownFiles().filter((f) => this.shouldInclude(f.path));
+  async reconcile(options: ReconcileOptions = {}): Promise<ReconcileSummary> {
+    const summary: ReconcileSummary = {
+      added: 0,
+      updated: 0,
+      deleted: 0,
+      unchanged: 0,
+      failed: 0,
+    };
+    const files = this.vault
+      .getMarkdownFiles()
+      .filter((f) => this.shouldInclude(f.path))
+      .sort(compareSyncFiles);
     const livePaths = new Set(files.map((f) => f.path));
+    let completed = 0;
 
-    await mapLimit(files, 3, async (file) => {
-      const outcome = await this.ingestFile(file, { persist: false });
-      if (outcome === "created") summary.added++;
-      else if (outcome === "updated") summary.updated++;
-      else summary.unchanged++;
+    await mapLimit(files, options.concurrency ?? 1, async (file) => {
+      try {
+        // Persist every terminally completed note. A stopped multi-day backfill
+        // resumes from this checkpoint instead of resubmitting finished notes.
+        const force =
+          typeof options.force === "function" ? options.force(file) : (options.force ?? false);
+        const outcome = await this.ingestFile(file, { force });
+        if (outcome === "created") summary.added++;
+        else if (outcome === "updated") summary.updated++;
+        else summary.unchanged++;
+        completed++;
+        await options.onProgress?.({
+          completed,
+          total: files.length,
+          path: file.path,
+          outcome,
+          summary: { ...summary },
+        });
+      } catch (error) {
+        summary.failed++;
+        completed++;
+        const detail = error instanceof Error ? error.message : String(error);
+        await options.onProgress?.({
+          completed,
+          total: files.length,
+          path: file.path,
+          error: detail,
+          summary: { ...summary },
+        });
+        if (!options.continueOnError) throw error;
+      }
     });
 
     // Prune by local index, NOT by listing server documents. Listing would also
@@ -218,11 +333,13 @@ export class SyncEngine {
     // `conversation/…`, or notes from another tool sharing the bank) and we'd
     // wrongly delete them. The trade-off: orphans created while the local index
     // was lost (reinstall) aren't auto-pruned — re-deleting the note fixes that.
-    for (const path of Object.keys(this.index)) {
-      if (!livePaths.has(path)) {
-        await this.client.deleteDocument(this.config.bankId, this.docId(path));
-        delete this.index[path];
-        summary.deleted++;
+    if (options.prune ?? true) {
+      for (const path of Object.keys(this.index)) {
+        if (!livePaths.has(path)) {
+          await this.client.deleteDocument(this.config.bankId, this.docId(path));
+          delete this.index[path];
+          summary.deleted++;
+        }
       }
     }
 

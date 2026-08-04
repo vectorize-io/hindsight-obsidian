@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "node esbuild.config.mjs production",
+    "build:cli": "node esbuild.cli.config.mjs",
     "dev": "node esbuild.config.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

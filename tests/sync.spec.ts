@@ -10,7 +10,11 @@ interface FileSpec {
 
 function fakeClient() {
   return {
-    retain: vi.fn(async (_bank: string, _docId: string, _content: string, _opts?: unknown) => {}),
+    retain: vi.fn(async (_bank: string, _docId: string, _content: string, _opts?: unknown) => ({
+      operationId: "op-1",
+      status: "completed" as const,
+      completedAt: "T0",
+    })),
     deleteDocument: vi.fn(async (_bank: string, _docId: string) => {}),
   };
 }
@@ -88,7 +92,7 @@ describe("SyncEngine", () => {
       string,
       string,
       string,
-      { tags: string[]; metadata: Record<string, string> },
+      { tags: string[]; metadata: Record<string, string>; observationScopes: string[][] },
     ];
     expect(docId).toBe("Personal/Work/Clients/acme.md");
     expect(opts.tags).toEqual(
@@ -100,10 +104,33 @@ describe("SyncEngine", () => {
         "created:2026-03",
         "updated:2026",
         "updated:2026-06",
+        "source:obsidian",
+        "lifecycle:current",
+        "kind:other",
       ])
     );
+    expect(opts.observationScopes).toEqual([
+      ["source:obsidian", "vault:Personal", "lifecycle:current"],
+    ]);
     expect(opts.metadata.path).toBe("Work/Clients/acme.md");
     expect(opts.metadata.vault).toBe("Personal");
+  });
+
+  it("retains full frontmatter while using parsed fields for metadata", async () => {
+    const raw = "---\nstatus: open\ntags: [project]\n---\n# Plan\nBody";
+    const files = { "TaskNotes/Tasks/plan.md": { content: raw, mtime: 1, ctime: 0 } };
+    const { engine, client, vault, index } = makeEngine(files);
+    await engine.ingestFile(vault.getMarkdownFiles()[0]);
+    expect(client.retain.mock.calls[0][2]).toBe(raw);
+    expect(client.retain.mock.calls[0][3]).toEqual(
+      expect.objectContaining({
+        tags: expect.arrayContaining(["kind:task", "lifecycle:current"]),
+      })
+    );
+    expect(index["TaskNotes/Tasks/plan.md"]).toMatchObject({
+      operationId: "op-1",
+      operationStatus: "completed",
+    });
   });
 
   it("re-ingests (updated) when content changes", async () => {
@@ -186,6 +213,76 @@ describe("SyncEngine", () => {
     expect(summary.deleted).toBe(1);
     expect(client.deleteDocument).toHaveBeenCalledWith("bank", "gone.md");
     expect(index["gone.md"]).toBeUndefined();
+  });
+
+  it("reconcile processes TaskNotes first, then each lane newest-first, and checkpoints", async () => {
+    const files = {
+      "Areas/newest.md": { content: "newest area", mtime: 400, ctime: 1 },
+      "TaskNotes/Tasks/older.md": { content: "older task", mtime: 100, ctime: 1 },
+      "Notes/older.md": { content: "older note", mtime: 200, ctime: 1 },
+      "TaskNotes/Tasks/newer.md": { content: "newer task", mtime: 300, ctime: 1 },
+    };
+    const { engine, client, persist } = makeEngine(files);
+
+    const summary = await engine.reconcile({ prune: false });
+
+    expect(client.retain.mock.calls.map((call) => call[1])).toEqual([
+      "TaskNotes/Tasks/newer.md",
+      "TaskNotes/Tasks/older.md",
+      "Areas/newest.md",
+      "Notes/older.md",
+    ]);
+    expect(persist).toHaveBeenCalledTimes(5); // one per note plus the final snapshot
+    expect(summary).toMatchObject({ added: 4, deleted: 0, failed: 0 });
+  });
+
+  it("safe backfill mode does not prune indexed documents missing from the manifest", async () => {
+    const index: SyncIndex = { "gone.md": { hash: "h", mtime: 1, syncedAt: "T0" } };
+    const { engine, client } = makeEngine({}, index);
+
+    const summary = await engine.reconcile({ prune: false });
+
+    expect(client.deleteDocument).not.toHaveBeenCalled();
+    expect(index["gone.md"]).toBeDefined();
+    expect(summary.deleted).toBe(0);
+  });
+
+  it("can bypass the local checkpoint for selected TaskNotes", async () => {
+    const files = {
+      "TaskNotes/Tasks/task.md": { content: "task", mtime: 1, ctime: 1 },
+      "Areas/area.md": { content: "area", mtime: 1, ctime: 1 },
+    };
+    const index: SyncIndex = {
+      "TaskNotes/Tasks/task.md": { hash: "old", mtime: 1, syncedAt: "T0" },
+      "Areas/area.md": { hash: "old", mtime: 1, syncedAt: "T0" },
+    };
+    const { engine, client } = makeEngine(files, index);
+
+    await engine.reconcile({
+      prune: false,
+      force: (file) => file.path.startsWith("TaskNotes/Tasks/"),
+    });
+
+    expect(client.retain.mock.calls.map((call) => call[1])).toEqual([
+      "TaskNotes/Tasks/task.md",
+    ]);
+  });
+
+  it("falls back to the file creation time for unresolved template timestamps", async () => {
+    const files = {
+      "Templates/daily.md": {
+        content: '---\ncreated: "{{date}}"\n---\nTemplate body',
+        mtime: 2_000,
+        ctime: 1_000,
+      },
+    };
+    const { engine, client, vault } = makeEngine(files);
+
+    await engine.ingestFile(vault.getMarkdownFiles()[0]);
+
+    expect(client.retain.mock.calls[0][3]).toEqual(
+      expect.objectContaining({ timestamp: "1970-01-01T00:00:01.000Z" })
+    );
   });
 
   it("respects exclude folders and vault-prefixed document ids", async () => {

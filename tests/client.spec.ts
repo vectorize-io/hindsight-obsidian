@@ -19,14 +19,18 @@ function lastCall() {
 describe("HindsightClient", () => {
   beforeEach(() => {
     mock.mockReset();
-    mock.mockResolvedValue(ok());
+    mock.mockImplementation(async (params) =>
+      params.url.includes("/operations/")
+        ? ok({ operation_id: "op-1", status: "completed", updated_at: "T1" })
+        : ok({ operation_id: "op-1" })
+    );
   });
 
   it("retain posts an upsert item with document_id and replace mode", async () => {
     const client = new HindsightClient("https://api.example.com/", "secret");
     await client.retain("bank x", "Folder/Note.md", "body text", { tags: ["t1"] });
 
-    const params = lastCall();
+    const params = mock.mock.calls[0][0];
     expect(params.method).toBe("POST");
     expect(params.url).toBe("https://api.example.com/v1/default/banks/bank%20x/memories");
     expect(params.headers?.Authorization).toBe("Bearer secret");
@@ -37,6 +41,7 @@ describe("HindsightClient", () => {
       update_mode: "replace",
       tags: ["t1"],
     });
+    expect(mock).toHaveBeenCalledTimes(2);
   });
 
   it("deleteDocument encodes segments but preserves path slashes", async () => {
@@ -54,7 +59,7 @@ describe("HindsightClient", () => {
     const client = new HindsightClient("https://api.example.com");
     const res = await client.reflect("b", "what?", { budget: "high", includeCitations: true });
 
-    const body = JSON.parse(lastCall().body ?? "{}");
+    const body = JSON.parse(mock.mock.calls[0][0].body ?? "{}");
     expect(body).toMatchObject({ query: "what?", budget: "high" });
     expect(body.include).toEqual({ facts: {}, tool_calls: {} });
     expect(res.text).toBe("answer");
@@ -108,7 +113,31 @@ describe("HindsightClient", () => {
   it("retain omits the tags field when no tags are given", async () => {
     const client = new HindsightClient("https://api.example.com");
     await client.retain("b", "Note.md", "body");
-    const body = JSON.parse(lastCall().body ?? "{}");
+    const body = JSON.parse(mock.mock.calls[0][0].body ?? "{}");
     expect(body.items[0].tags).toBeUndefined();
+  });
+
+  it("retain sends observation scopes and waits for terminal completion", async () => {
+    const client = new HindsightClient("https://api.example.com", undefined, 0, 1_000);
+    const result = await client.retain("b", "Note.md", "body", {
+      observationScopes: [["source:obsidian", "vault:Main", "lifecycle:current"]],
+    });
+    const firstBody = JSON.parse(mock.mock.calls[0][0].body ?? "{}");
+    expect(firstBody.items[0].observation_scopes).toEqual([
+      ["source:obsidian", "vault:Main", "lifecycle:current"],
+    ]);
+    expect(result).toEqual({ operationId: "op-1", status: "completed", completedAt: "T1" });
+  });
+
+  it("does not report retain success when the async operation fails", async () => {
+    mock.mockImplementation(async (params) =>
+      params.url.includes("/operations/")
+        ? ok({ operation_id: "op-1", status: "failed", error: "extractor failed" })
+        : ok({ operation_id: "op-1" })
+    );
+    const client = new HindsightClient("https://api.example.com", undefined, 0, 1_000);
+    await expect(client.retain("b", "Note.md", "body")).rejects.toThrow(
+      /operation op-1 failed/
+    );
   });
 });

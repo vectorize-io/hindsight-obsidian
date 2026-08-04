@@ -25,10 +25,26 @@ export type TagGroup = TagLeaf | TagAnd;
 export interface RetainOptions {
   tags?: string[];
   metadata?: Record<string, string>;
+  /** Stable scopes used to consolidate related memories across changing provenance tags. */
+  observationScopes?: string[][];
   /** ISO 8601 timestamp, or "unset" for timeless content. */
   timestamp?: string;
   context?: string;
   updateMode?: "replace" | "append";
+}
+
+export interface RetainResult {
+  operationId: string;
+  status: "completed";
+  completedAt?: string;
+}
+
+export interface OperationResponse {
+  operation_id: string;
+  status: "pending" | "processing" | "completed" | "failed" | "cancelled";
+  updated_at?: string;
+  error?: unknown;
+  result_metadata?: Record<string, unknown>;
 }
 
 /** A fact cited by reflect via `based_on.memories`. */
