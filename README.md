@@ -59,6 +59,7 @@ Open **Settings → Hindsight**:
 | Exclude tags              | —                                    | Notes whose frontmatter `tags` include one of these (e.g. `private`) never sync; already-synced ones are removed |
 | Retain strategy           | bank default                         | Named retain strategy on the bank for every note; a note's frontmatter `hindsight_retain_strategy` overrides it  |
 | Sync on edit              | on                                   | Re-ingest notes automatically as you edit                                                                        |
+| Delay automatic uploads   | **off**                              | Wait 30 seconds, 1, 5, or 15 minutes without edits before upload; manual syncs are immediate                     |
 | Observation consolidation | server default                       | Optional named observation scope for newly ingested content                                                      |
 | Date facts by             | creation time                        | Last-edit time dates facts by frontmatter `updated`/`modified`, else the file's modified time                    |
 | Default chat depth        | low                                  | Reflect budget for chat answers                                                                                  |
