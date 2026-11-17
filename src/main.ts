@@ -19,7 +19,11 @@ export default class HindsightPlugin extends Plugin {
   private client: HindsightClient | null = null;
   private engine: SyncEngine | null = null;
   private dirty = new Set<string>();
+  private lastChangeAt = new Map<string, number>();
   private scheduleFlush!: Debouncer<[], void>;
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushing = false;
+  private unloaded = false;
   // Sync-status indicator state (surfaced in the status bar).
   private statusBarEl: HTMLElement | null = null;
   private statusTextEl: HTMLElement | null = null;
@@ -32,6 +36,13 @@ export default class HindsightPlugin extends Plugin {
     await this.loadPluginData();
     this.rebuildClient();
     this.scheduleFlush = debounce(() => void this.flushDirty(), 4000, false);
+    this.register(() => {
+      this.unloaded = true;
+      this.scheduleFlush.cancel();
+      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+      this.quietTimer = null;
+      this.lastChangeAt.clear();
+    });
 
     addIcon(HINDSIGHT_ICON_ID, HINDSIGHT_ICON_SVG);
     this.registerView(VIEW_TYPE_CHAT, (leaf) => new ChatView(leaf, this));
@@ -163,6 +174,16 @@ export default class HindsightPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     this.rebuildClient();
+    if (!this.settings.syncOnEdit) {
+      this.dirty.clear();
+      this.lastChangeAt.clear();
+      this.scheduleFlush.cancel();
+      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+      this.quietTimer = null;
+      this.updateStatusBar();
+    } else if (this.dirty.size) {
+      this.scheduleDirtyFlush();
+    }
     await this.savePluginData();
   }
 
@@ -218,15 +239,20 @@ export default class HindsightPlugin extends Plugin {
     const onUpsert = (file: unknown): void => {
       if (!this.settings.syncOnEdit || !isMd(file)) return;
       this.dirty.add(file.path);
+      this.lastChangeAt.set(file.path, Date.now());
       this.updateStatusBar(); // reflect the new pending count immediately
-      this.scheduleFlush();
+      this.scheduleDirtyFlush();
     };
     this.registerEvent(this.app.vault.on("create", onUpsert));
     this.registerEvent(this.app.vault.on("modify", onUpsert));
 
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.lastChangeAt.delete(file.path);
+        this.dirty.delete(file.path);
+        this.scheduleDirtyFlush();
         if (!this.settings.syncOnEdit || !isMd(file) || !this.engine) return;
+        this.updateStatusBar();
         const engine = this.engine;
         this.withSync(() => engine.handleDelete(file.path)).catch((err) => this.reportError(err));
       })
@@ -234,32 +260,99 @@ export default class HindsightPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (!this.settings.syncOnEdit || !isMd(file) || !this.engine) return;
-        const engine = this.engine;
-        this.withSync(() => engine.handleRename(file, oldPath)).catch((err) =>
-          this.reportError(err)
-        );
+        this.lastChangeAt.delete(oldPath);
+        this.dirty.delete(oldPath);
+        if (!this.settings.syncOnEdit || !isMd(file) || !this.engine) {
+          this.scheduleDirtyFlush();
+          return;
+        }
+        this.updateStatusBar();
+        if (this.settings.uploadQuietPeriod > 0) {
+          this.dirty.add(file.path);
+          this.lastChangeAt.set(file.path, Date.now());
+          this.updateStatusBar();
+          this.scheduleDirtyFlush();
+          const engine = this.engine;
+          this.withSync(() => engine.handleDelete(oldPath)).catch((err) => this.reportError(err));
+        } else {
+          const engine = this.engine;
+          this.scheduleDirtyFlush();
+          this.withSync(() => engine.handleRename(file, oldPath)).catch((err) =>
+            this.reportError(err)
+          );
+        }
       })
     );
   }
 
+  private scheduleDirtyFlush(): void {
+    if (this.unloaded || !this.settings.syncOnEdit) return;
+    if (!this.dirty.size) {
+      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+      this.quietTimer = null;
+      return;
+    }
+    if (this.settings.uploadQuietPeriod === 0) {
+      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+      this.quietTimer = null;
+      this.scheduleFlush();
+      return;
+    }
+    // Keep the earliest deadline even if another note is edited continuously.
+    let wait = Infinity;
+    for (const path of this.dirty) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) {
+        wait = Math.min(
+          wait,
+          Math.max(
+            0,
+            (this.lastChangeAt.get(path) ?? 0) + this.settings.uploadQuietPeriod - Date.now()
+          )
+        );
+      } else {
+        wait = 0; // clear stale paths on the next flush
+      }
+    }
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    if (Number.isFinite(wait)) {
+      this.quietTimer = setTimeout(() => {
+        this.quietTimer = null;
+        void this.flushDirty();
+      }, wait);
+    }
+  }
+
   private async flushDirty(): Promise<void> {
-    if (!this.engine || this.dirty.size === 0) return;
+    if (this.unloaded || !this.settings.syncOnEdit || !this.engine || !this.dirty.size || this.flushing) return;
+    this.flushing = true;
     const engine = this.engine;
     const paths = [...this.dirty];
-    this.dirty.clear();
-    await this.withSync(async () => {
-      for (const path of paths) {
-        const file = this.app.vault.getAbstractFileByPath(path);
-        if (file instanceof TFile) {
-          try {
-            await engine.ingestFile(file);
-          } catch (err) {
-            this.reportError(err);
+    try {
+      await this.withSync(async () => {
+        for (const path of paths) {
+          if (this.unloaded || !this.settings.syncOnEdit) break;
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (
+            file instanceof TFile &&
+            this.settings.uploadQuietPeriod > 0 &&
+            Date.now() - (this.lastChangeAt.get(path) ?? 0) < this.settings.uploadQuietPeriod
+          ) continue;
+          this.dirty.delete(path);
+          this.lastChangeAt.delete(path);
+          if (file instanceof TFile) {
+            try {
+              await engine.ingestFile(file);
+            } catch (err) {
+              this.reportError(err);
+            }
           }
         }
-      }
-    });
+      });
+    } finally {
+      this.flushing = false;
+      if (this.dirty.size) this.scheduleDirtyFlush();
+    }
   }
 
   // ── Wiring / persistence ────────────────────────────────────────────────
@@ -299,6 +392,9 @@ export default class HindsightPlugin extends Plugin {
   private async loadPluginData(): Promise<void> {
     const data = (await this.loadData()) as Partial<PluginData> | null;
     this.settings = { ...DEFAULT_SETTINGS, ...(data?.settings ?? {}) };
+    if (![0, 30_000, 60_000, 300_000, 900_000].includes(this.settings.uploadQuietPeriod)) {
+      this.settings.uploadQuietPeriod = 0;
+    }
     this.syncIndex = data?.syncIndex ?? {};
     this.lastSyncAt = data?.lastSyncAt ?? null;
   }

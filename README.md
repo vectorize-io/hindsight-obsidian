@@ -57,6 +57,7 @@ Open **Settings → Hindsight**:
 | Bank name                 | `obsidian`                           | Shared bank for all your vaults (separated by `vault:` tags)                                   |
 | Include / exclude folders | —                                    | Limit which notes sync                                                                         |
 | Sync on edit              | on                                   | Re-ingest notes automatically as you edit                                                      |
+| Delay automatic uploads   | **off**                              | Wait 30 seconds, 1, 5, or 15 minutes without edits before upload; manual syncs are immediate   |
 | Observation consolidation | server default                       | Optional named observation scope for newly ingested content                                    |
 | Date facts by             | creation time                        | Last-edit time dates facts by frontmatter `updated`/`modified`, else the file's modified time  |
 | Default chat depth        | low                                  | Reflect budget for chat answers                                                                |
