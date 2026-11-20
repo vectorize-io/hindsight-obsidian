@@ -7,10 +7,13 @@ function file(path: string, mtime: number): TFile {
   return Object.assign(new TFile(), { path, extension: "md", stat: { mtime, ctime: mtime } });
 }
 
+const reconcileSummary = { added: 0, updated: 2, deleted: 0, unchanged: 0 };
+
 function fixture(period: number) {
   const files = new Map<string, TFile>();
   const events = new Map<string, (...args: unknown[]) => void>();
   const ingestFile = vi.fn(async (_file: TFile) => "created");
+  const reconcile = vi.fn(async () => reconcileSummary);
   const scheduleFlush = Object.assign(vi.fn(), { cancel: vi.fn() });
   const plugin = new HindsightPlugin({} as App, {} as PluginManifest) as unknown as {
     settings: HindsightSettings;
@@ -18,6 +21,7 @@ function fixture(period: number) {
     dirty: Set<string>;
     engine: {
       ingestFile: typeof ingestFile;
+      reconcile: typeof reconcile;
       handleDelete: ReturnType<typeof vi.fn>;
       handleRename: ReturnType<typeof vi.fn>;
     };
@@ -25,6 +29,9 @@ function fixture(period: number) {
     registerVaultWatchers(): void;
     scheduleFlush: typeof scheduleFlush;
     scheduleDirtyFlush(): void;
+    syncVault(): Promise<void>;
+    savePluginData(): Promise<void>;
+    reportError(err: unknown): void;
     flushDirty(): Promise<void>;
     updateStatusBar(): void;
   };
@@ -38,11 +45,14 @@ function fixture(period: number) {
   } } as unknown as App;
   plugin.engine = {
     ingestFile,
+    reconcile,
     handleDelete: vi.fn(async () => {}),
     handleRename: vi.fn(async () => {}),
   };
   plugin.scheduleFlush = scheduleFlush;
   plugin.updateStatusBar = vi.fn();
+  plugin.savePluginData = vi.fn(async () => {});
+  plugin.reportError = vi.fn();
   plugin.registerEvent = vi.fn();
   plugin.registerVaultWatchers();
   const emit = (event: string, ...args: unknown[]) => events.get(event)!(...args);
@@ -75,6 +85,104 @@ describe("automatic upload quiet period", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(ingestFile).toHaveBeenCalledOnce();
     expect(plugin.dirty.size).toBe(0);
+  });
+
+  it("reconciles immediately and cancels pending automatic uploads on manual sync", async () => {
+    vi.useFakeTimers();
+    const { plugin, files, ingestFile, scheduleFlush, emit } = fixture(60_000);
+    for (const path of ["a.md", "b.md"]) {
+      const note = file(path, Date.now());
+      files.set(path, note);
+      emit("modify", note);
+    }
+    expect(vi.getTimerCount()).toBe(1);
+
+    const sync = plugin.syncVault();
+    expect(plugin.engine.reconcile).toHaveBeenCalledOnce();
+    expect(scheduleFlush.cancel).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await sync;
+    expect(plugin.dirty.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ingestFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps edits made during manual sync on their own quiet period", async () => {
+    vi.useFakeTimers();
+    const { plugin, files, ingestFile, emit } = fixture(60_000);
+    const note = file("a.md", Date.now());
+    files.set(note.path, note);
+    emit("modify", note);
+    let finish!: () => void;
+    plugin.engine.reconcile.mockImplementationOnce(() => new Promise((resolve) => {
+      finish = () => resolve(reconcileSummary);
+    }));
+
+    const sync = plugin.syncVault();
+    await vi.advanceTimersByTimeAsync(10_000);
+    emit("modify", note);
+    await plugin.syncVault(); // a second click must not take over the newer edit
+    expect(plugin.engine.reconcile).toHaveBeenCalledOnce();
+    finish();
+    await sync;
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(ingestFile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ingestFile).toHaveBeenCalledExactlyOnceWith(note);
+  });
+
+  it("does not let an in-flight automatic upload consume edits after manual sync", async () => {
+    vi.useFakeTimers();
+    const { plugin, files, ingestFile, emit } = fixture(60_000);
+    const first = file("first.md", Date.now());
+    const next = file("next.md", Date.now());
+    for (const note of [first, next]) {
+      files.set(note.path, note);
+      emit("modify", note);
+    }
+    let finish!: () => void;
+    ingestFile.mockImplementationOnce(() => new Promise((resolve) => {
+      finish = () => resolve("created");
+    }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ingestFile).toHaveBeenCalledExactlyOnceWith(first);
+    await plugin.syncVault();
+    emit("modify", first);
+    finish();
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(ingestFile).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ingestFile.mock.calls).toEqual([[first], [first]]);
+  });
+
+  it("restores pending uploads after a failed manual sync, except deleted notes", async () => {
+    vi.useFakeTimers();
+    const { plugin, files, ingestFile, emit } = fixture(60_000);
+    const kept = file("kept.md", Date.now());
+    const deleted = file("deleted.md", Date.now());
+    for (const note of [kept, deleted]) {
+      files.set(note.path, note);
+      emit("modify", note);
+    }
+    await vi.advanceTimersByTimeAsync(10_000);
+    const error = new Error("reconcile failed");
+    let fail!: () => void;
+    plugin.engine.reconcile.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      fail = () => reject(error);
+    }));
+
+    const sync = plugin.syncVault();
+    files.delete(deleted.path);
+    emit("delete", deleted);
+    fail();
+    await sync;
+    expect(plugin.reportError).toHaveBeenCalledWith(error);
+    expect(plugin.dirty).toEqual(new Set([kept.path]));
+    await vi.advanceTimersByTimeAsync(49_999);
+    expect(ingestFile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ingestFile).toHaveBeenCalledExactlyOnceWith(kept);
   });
 
   it("waits a full quiet period after renaming an old note", async () => {

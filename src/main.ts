@@ -23,6 +23,7 @@ export default class HindsightPlugin extends Plugin {
   private scheduleFlush!: Debouncer<[], void>;
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private flushing = false;
+  private manualSyncing = false;
   private unloaded = false;
   // Sync-status indicator state (surfaced in the status bar).
   private statusBarEl: HTMLElement | null = null;
@@ -38,9 +39,7 @@ export default class HindsightPlugin extends Plugin {
     this.scheduleFlush = debounce(() => void this.flushDirty(), 4000, false);
     this.register(() => {
       this.unloaded = true;
-      this.scheduleFlush.cancel();
-      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
-      this.quietTimer = null;
+      this.cancelScheduledFlush();
       this.lastChangeAt.clear();
     });
 
@@ -177,9 +176,7 @@ export default class HindsightPlugin extends Plugin {
     if (!this.settings.syncOnEdit) {
       this.dirty.clear();
       this.lastChangeAt.clear();
-      this.scheduleFlush.cancel();
-      if (this.quietTimer !== null) clearTimeout(this.quietTimer);
-      this.quietTimer = null;
+      this.cancelScheduledFlush();
       this.updateStatusBar();
     } else if (this.dirty.size) {
       this.scheduleDirtyFlush();
@@ -202,20 +199,37 @@ export default class HindsightPlugin extends Plugin {
   }
 
   async syncVault(): Promise<void> {
+    if (this.manualSyncing) return;
     if (!this.engine) {
       new Notice("Hindsight: configure an API URL first.");
       return;
     }
-    new Notice("Hindsight: syncing vault…");
+    const engine = this.engine;
+    const pending = this.lastChangeAt;
+    this.dirty = new Set();
+    this.lastChangeAt = new Map();
+    this.cancelScheduledFlush();
+    this.manualSyncing = true;
     try {
-      const engine = this.engine;
+      new Notice("Hindsight: syncing vault…");
       const s = await this.withSync(() => engine.reconcile());
       await this.savePluginData();
       new Notice(
         `Hindsight: ${s.added} added, ${s.updated} updated, ${s.deleted} deleted, ${s.unchanged} unchanged.`
       );
     } catch (err) {
+      if (!this.unloaded && this.settings.syncOnEdit) {
+        for (const [path, changedAt] of pending) {
+          if (this.dirty.has(path) || !(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) continue;
+          this.dirty.add(path);
+          this.lastChangeAt.set(path, changedAt);
+        }
+        this.updateStatusBar();
+      }
       this.reportError(err);
+    } finally {
+      this.manualSyncing = false;
+      this.scheduleDirtyFlush();
     }
   }
 
@@ -285,8 +299,14 @@ export default class HindsightPlugin extends Plugin {
     );
   }
 
+  private cancelScheduledFlush(): void {
+    this.scheduleFlush.cancel();
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
+  }
+
   private scheduleDirtyFlush(): void {
-    if (this.unloaded || !this.settings.syncOnEdit) return;
+    if (this.unloaded || !this.settings.syncOnEdit || this.manualSyncing) return;
     if (!this.dirty.size) {
       if (this.quietTimer !== null) clearTimeout(this.quietTimer);
       this.quietTimer = null;
@@ -324,14 +344,15 @@ export default class HindsightPlugin extends Plugin {
   }
 
   private async flushDirty(): Promise<void> {
-    if (this.unloaded || !this.settings.syncOnEdit || !this.engine || !this.dirty.size || this.flushing) return;
+    if (this.unloaded || !this.settings.syncOnEdit || !this.engine || !this.dirty.size || this.flushing || this.manualSyncing) return;
     this.flushing = true;
     const engine = this.engine;
-    const paths = [...this.dirty];
+    const queue = this.dirty;
     try {
       await this.withSync(async () => {
-        for (const path of paths) {
-          if (this.unloaded || !this.settings.syncOnEdit) break;
+        for (const path of [...queue]) {
+          // Manual sync takes over the old queue, even if the same path is edited again.
+          if (this.unloaded || !this.settings.syncOnEdit || this.dirty !== queue) break;
           const file = this.app.vault.getAbstractFileByPath(path);
           if (
             file instanceof TFile &&
