@@ -14,6 +14,8 @@ export interface HindsightSettings {
   /** Default retain strategy name; blank = the bank's default. */
   retainStrategy: string;
   syncOnEdit: boolean;
+  /** Milliseconds a note must remain unmodified before automatic upload; 0 = off. */
+  uploadQuietPeriod: number;
   defaultBudget: Budget;
   /** DESIGN.md §0.5: OFF by default — keeps Hindsight from becoming a 2nd source of truth. */
   rememberConversations: boolean;
@@ -38,6 +40,7 @@ export const DEFAULT_SETTINGS: HindsightSettings = {
   excludeTags: [],
   retainStrategy: "",
   syncOnEdit: true,
+  uploadQuietPeriod: 0,
   defaultBudget: "low",
   rememberConversations: false,
   // On by default: all vaults share one bank, so document ids must be vault-prefixed
@@ -161,6 +164,25 @@ export class HindsightSettingTab extends PluginSettingTab {
           this.plugin.settings.syncOnEdit = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Delay automatic uploads")
+      .setDesc("Wait until a note has not changed for this long before uploading it. Manual syncs upload immediately.")
+      .addDropdown((d) =>
+        d
+          .addOptions({
+            "0": "Off",
+            "30000": "30 seconds",
+            "60000": "1 minute",
+            "300000": "5 minutes",
+            "900000": "15 minutes",
+          })
+          .setValue(String(this.plugin.settings.uploadQuietPeriod))
+          .onChange(async (v) => {
+            this.plugin.settings.uploadQuietPeriod = Number(v);
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(containerEl)
